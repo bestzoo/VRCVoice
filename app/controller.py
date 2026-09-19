@@ -63,6 +63,8 @@ class RecognitionController:
                     entry = m
                     break
             if entry:
+                if entry.get("capability", "text") != "speech":
+                    raise ValueError(f"模型 {name!r} 不是语音识别模型，请在 AI 设置中选择“语音识别”用途")
                 return CloudASR(
                     endpoint=entry.get("endpoint", ""),
                     api_key=entry.get("api_key", ""),
@@ -202,21 +204,27 @@ class RecognitionController:
             self._active = False
         data = self.recorder.stop()
         text = ""
+        error = ""
         try:
             if self.asr is not None and len(data) > 0:
                 text = self.asr.finalize() or ""
                 if not text and getattr(self.asr, "last_error", ""):
-                    text = f"[错误] {self.asr.last_error}"
+                    error = f"[错误] {self.asr.last_error}"
         except Exception as e:
-            print(f"[controller] 识别收尾失败: {e}")
-            text = self._partial_text
+            error = f"[错误] 识别收尾失败: {e}"
+            log(f"[controller] {error}")
         self.output.on_recording_stopped()
         if self.on_state_changed:
             self.on_state_changed(False)
+        # 错误只交给软件界面和日志，绝不能进入 OSC/键盘输出或聊天历史。
+        if error:
+            log(f"[controller] 触发: 结束, {error}")
+            if self.on_finished:
+                self.on_finished(error)
+            return
         if text.strip():
             self._last_text = text
-            if not text.startswith("[错误]") and (
-                    self.settings.get("polish", "enabled")
+            if (self.settings.get("polish", "enabled")
                     or self.settings.get("translate", "enabled")):
                 self._start_polish(text)
                 return  # 润色/翻译流程自己走 finished(不在这里发)
@@ -316,12 +324,13 @@ class RecognitionController:
             data = json.loads(resp.read().decode("utf-8"))
         return data["choices"][0]["message"]["content"].strip()
 
-    def _resolve_model(self, name: str):
-        """按条目名在模型库里找模型配置; 找不到或没选返回 None。"""
+    def _resolve_model(self, name: str, capability: str = ""):
+        """按条目名和用途找模型配置；找不到、没选或用途不符返回 None。"""
         if not name:
             return None
         for m in (self.settings.section("ai_models").get("list") or []):
-            if m.get("name") == name:
+            if (m.get("name") == name
+                    and (not capability or m.get("capability", "text") == capability)):
                 return m
         return None
 
@@ -329,7 +338,7 @@ class RecognitionController:
         import json
         import urllib.request
         s = self.settings.section("polish")
-        m = self._resolve_model(s.get("use_model", ""))
+        m = self._resolve_model(s.get("use_model", ""), "text")
         if not m:
             log("[controller] 润色未选模型或模型不存在, 用原识别文本")
             return text
@@ -395,7 +404,7 @@ class RecognitionController:
         name = (ts.get("use_model", "") or "").strip()
         if not name:
             return False, "翻译还没选模型: 请先到「AI 设置」添加模型(云端多家/本地多家均可), 再到「AI 翻译」页选一个"
-        m = self._resolve_model(name)
+        m = self._resolve_model(name, "text")
         if not m:
             return False, f"翻译选的模型 {name!r} 已被删除: 请到「AI 设置」重新添加, 或在「AI 翻译」页重选"
         if not (m.get("model") or "").strip() or not (m.get("endpoint") or "").strip():
@@ -407,7 +416,7 @@ class RecognitionController:
         if not self.settings.get("translate", "enabled"):
             return None
         ts = self.settings.section("translate")
-        m = self._resolve_model(ts.get("use_model", ""))
+        m = self._resolve_model(ts.get("use_model", ""), "text")
         if not m:
             log("[controller] 翻译未选模型或模型不存在, 跳过翻译")
             return None
@@ -462,6 +471,25 @@ class RecognitionController:
             return sorted(m["name"].replace("models/", "")
                           for m in data.get("models", []))
         return sorted(m["id"] for m in data.get("data", []))
+
+    def probe_model(self, entry: dict) -> tuple:
+        """按模型用途执行真实能力测试，返回 (成功, 简短说明)。"""
+        capability = entry.get("capability", "text")
+        endpoint = (entry.get("endpoint") or "").strip()
+        model = (entry.get("model") or "").strip()
+        api_key = (entry.get("api_key") or "").strip()
+        if not endpoint or not model:
+            return False, "模型名或 API 地址为空"
+        try:
+            timeout = max(3, min(int(entry.get("timeout_sec") or 15), 30))
+            if capability == "speech":
+                return CloudASR.probe(endpoint, api_key, model, timeout)
+            result = self._chat_completion(
+                entry.get("provider") or "custom", model, endpoint, api_key,
+                timeout, "你是一个连通性测试助手。", "请只回复两个字：收到")
+            return True, (result or "文字接口请求成功")[:80]
+        except Exception as e:
+            return False, str(e).replace("\r", " ").replace("\n", " ")[:160]
 
     def refresh(self):
         """设置变更后重建输出等。"""

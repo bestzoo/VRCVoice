@@ -125,31 +125,33 @@ class VRCSettingCardGroup(SettingCardGroup):
 PROVIDERS = {
     "deepseek": {
         "name": "DeepSeek",
-        "endpoint": "https://api.deepseek.com/chat/completions",
+        "text_endpoint": "https://api.deepseek.com/chat/completions",
         "models_url": "https://api.deepseek.com/models",
         "kind": "openai",
     },
     "siliconflow": {
         "name": "硅基流动",
-        "endpoint": "https://api.siliconflow.cn/v1/chat/completions",
+        "text_endpoint": "https://api.siliconflow.cn/v1/chat/completions",
+        "speech_endpoint": "https://api.siliconflow.cn/v1/audio/transcriptions",
         "models_url": "https://api.siliconflow.cn/v1/models",
         "kind": "openai",
     },
     "openai": {
         "name": "OpenAI (ChatGPT)",
-        "endpoint": "https://api.openai.com/v1/chat/completions",
+        "text_endpoint": "https://api.openai.com/v1/chat/completions",
+        "speech_endpoint": "https://api.openai.com/v1/audio/transcriptions",
         "models_url": "https://api.openai.com/v1/models",
         "kind": "openai",
     },
     "anthropic": {
         "name": "Claude",
-        "endpoint": "https://api.anthropic.com/v1/messages",
+        "text_endpoint": "https://api.anthropic.com/v1/messages",
         "models_url": "https://api.anthropic.com/v1/models",
         "kind": "anthropic",
     },
     "gemini": {
         "name": "Gemini",
-        "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        "text_endpoint": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         "models_url": "https://generativelanguage.googleapis.com/v1beta/models?key={key}",
         "kind": "gemini",
     },
@@ -1119,10 +1121,10 @@ class StatusPage(CardWidget):
         self.partial_label.setText(tr("实时识别: {text}", text=text))
 
     def _on_finished(self, text: str):
-        if text:
-            self.last_label.setText(tr("最近发送: {text}", text=text))
-        elif text.startswith("[错误]"):
+        if text.startswith("[错误]"):
             self.last_label.setText(tr("错误: {text}", text=text))
+        elif text:
+            self.last_label.setText(tr("最近发送: {text}", text=text))
         else:
             self.last_label.setText(tr("最近发送: (未识别到内容)"))
 
@@ -1183,6 +1185,11 @@ class _ModelEditDialog(QDialog):
         self.name_edit.setPlaceholderText("DeepSeek")
         form.addRow(tr("名称 *"), self.name_edit)
 
+        self.capability_combo = ComboBox(self)
+        self.capability_combo.addItem(tr("文字对话（润色/翻译）"), userData="text")
+        self.capability_combo.addItem(tr("语音识别（语音转文字）"), userData="speech")
+        form.addRow(tr("模型用途"), self.capability_combo)
+
         self.kind_combo = ComboBox(self)
         self.kind_combo.addItems([tr("云端服务"), tr("本地模型")])
         form.addRow(tr("类型"), self.kind_combo)
@@ -1235,6 +1242,8 @@ class _ModelEditDialog(QDialog):
         # 预填
         if entry:
             self.name_edit.setText(entry.get("name", ""))
+            cap_idx = self.capability_combo.findData(entry.get("capability", "text"))
+            self.capability_combo.setCurrentIndex(max(0, cap_idx))
             self.kind_combo.setCurrentText(tr("本地模型") if entry.get("kind") == "local" else tr("云端服务"))
             idx = self.provider_combo.findData(entry.get("provider", "custom"))
             if idx >= 0:
@@ -1243,9 +1252,10 @@ class _ModelEditDialog(QDialog):
             self.key_edit.setText(entry.get("api_key", ""))
             self.model_edit.setText(entry.get("model", ""))
             self.timeout_spin.setValue(int(entry.get("timeout_sec", 15) or 15))
+        self.capability_combo.currentIndexChanged.connect(self._on_capability_changed)
         self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
-        self._on_kind_changed(self.kind_combo.currentIndex())
+        self._sync_capability_ui(fill_endpoint=False)
 
     def _set_row_visible(self, form: QFormLayout, widget, visible: bool):
         try:
@@ -1256,25 +1266,50 @@ class _ModelEditDialog(QDialog):
     def _on_kind_changed(self, idx):
         is_local = idx == 1
         self._set_row_visible(self.layout(), self.provider_combo, not is_local)
-        self.fetch_btn.setVisible(not is_local)
+        is_speech = self.capability_combo.currentData() == "speech"
+        self.fetch_btn.setVisible(not is_local and not is_speech)
         if is_local:
             self.endpoint_edit.setPlaceholderText("http://127.0.0.1:11434/v1/chat/completions")
             self.key_edit.setPlaceholderText(tr("本地服务一般不用 Key, 留空即可"))
             self.endpoint_edit.setText("http://127.0.0.1:11434/v1/chat/completions")
         else:
-            self.endpoint_edit.setPlaceholderText("https://api.xxx.com/v1/chat/completions")
+            suffix = "/v1/audio/transcriptions" if is_speech else "/v1/chat/completions"
+            self.endpoint_edit.setPlaceholderText("https://api.xxx.com" + suffix)
             self.key_edit.setPlaceholderText(tr("sk-... (本地模型一般留空)"))
+
+    def _on_capability_changed(self, _idx):
+        self._sync_capability_ui(fill_endpoint=True)
+
+    def _sync_capability_ui(self, fill_endpoint: bool):
+        is_speech = self.capability_combo.currentData() == "speech"
+        if is_speech:
+            self.kind_combo.setCurrentIndex(0)
+        self.kind_combo.setEnabled(not is_speech)
+        self._on_kind_changed(self.kind_combo.currentIndex())
+        self.model_edit.setPlaceholderText(
+            tr("语音模型名, 如 FunAudioLLM/SenseVoiceSmall") if is_speech
+            else tr("模型名, 如 deepseek-chat / qwen2.5:7b"))
+        if fill_endpoint:
+            self._on_provider_changed(self.provider_combo.currentIndex())
 
     def _on_provider_changed(self, idx):
         raw = self.provider_combo.currentData() or "custom"
         p = PROVIDERS.get(raw)
         if p and self.kind_combo.currentIndex() == 0:
-            self.endpoint_edit.setText(p["endpoint"])
+            capability = self.capability_combo.currentData() or "text"
+            endpoint = p.get(f"{capability}_endpoint", "")
+            self.endpoint_edit.setText(endpoint)
+            if not endpoint:
+                self.endpoint_edit.setPlaceholderText(tr("该服务商没有预设语音接口，请选择自定义或手动填写"))
+        elif raw == "custom" and self.kind_combo.currentIndex() == 0:
+            # 切换用途/服务商后不要遗留另一种请求格式的地址。
+            self.endpoint_edit.clear()
 
     def _collect(self):
         return {
             "name": self.name_edit.text().strip(),
-            "kind": "local" if self.kind_combo.currentIndex() == 1 else "cloud",
+            "capability": self.capability_combo.currentData() or "text",
+            "kind": ("local" if self.kind_combo.currentIndex() == 1 else "cloud"),
             "provider": self.provider_combo.currentData() or "custom",
             "endpoint": self.endpoint_edit.text().strip(),
             "api_key": self.key_edit.text().strip(),
@@ -1358,13 +1393,8 @@ class _ModelEditDialog(QDialog):
         threading.Thread(target=self._test_bg, args=(data,), daemon=True).start()
 
     def _test_bg(self, data: dict):
-        try:
-            r = self.controller._chat_completion(
-                data["provider"], data["model"], data["endpoint"], data["api_key"],
-                data["timeout_sec"], "你是一个连通性测试助手。", "请只回复两个字: 收到")
-            self._test_done.emit((r or "")[:80], True)
-        except Exception as e:
-            self._test_done.emit(str(e)[:160], False)
+        ok, message = self.controller.probe_model(data)
+        self._test_done.emit(message, ok)
 
     def _on_test_done(self, text: str, ok: bool):
         self.test_btn.setEnabled(True)
@@ -1746,8 +1776,13 @@ class MainWindow(FluentWindow):
         _apply_backend(s.get("recognition", "backend"))
         layout.addWidget(grp)
         # 云端模型下拉初始填充(与模型库同步)
-        self.cloud_model_card.set_models(s.ai_model_names(), s.get("recognition", "cloud_model"))
-        self.rec_banner.setVisible(not bool(s.ai_model_names()))
+        speech_names = s.ai_model_names("speech")
+        current_speech = s.get("recognition", "cloud_model")
+        if speech_names and current_speech not in speech_names:
+            current_speech = speech_names[0]
+            s.set("recognition", "cloud_model", current_speech)
+        self.cloud_model_card.set_models(speech_names, s.get("recognition", "cloud_model"))
+        self.rec_banner.setVisible(not bool(speech_names))
 
         # ---- 触发 ----
         grp = VRCSettingCardGroup(tr("触发设置"), self.settings_page)
@@ -1987,7 +2022,7 @@ class MainWindow(FluentWindow):
         grp.addSettingCard(self.polish_enable_card)
         self.polish_model_card = ComboCard(
             tr("使用模型"), tr("用哪个模型润色; 模型在「AI 设置」页添加(云端/本地多家都可以)"),
-            s.ai_model_names(),
+            s.ai_model_names("text"),
             lambda: s.get("polish", "use_model"),
             lambda v: s.set("polish", "use_model", v),
             icon=FluentIcon.ROBOT)
@@ -2055,7 +2090,7 @@ class MainWindow(FluentWindow):
                     tr("翻译配置不完整, 已自动关闭"), tip, parent=self, duration=8000))
         self.tr_model_card = ComboCard(
             tr("使用模型"), tr("用哪个模型润色; 模型在「AI 设置」页添加(云端/本地多家都可以)"),
-            s.ai_model_names(),
+            s.ai_model_names("text"),
             lambda: s.get("translate", "use_model"),
             lambda v: s.set("translate", "use_model", v),
             icon=FluentIcon.ROBOT)
@@ -2184,6 +2219,8 @@ class MainWindow(FluentWindow):
             for section in ("polish", "translate"):
                 if self.settings.get(section, "use_model") == name:
                     self.settings.set(section, "use_model", "")
+            if self.settings.get("recognition", "cloud_model") == name:
+                self.settings.set("recognition", "cloud_model", "")
             self.settings.save()
             self._rebuild_model_list()
             self._refresh_model_combos()
@@ -2193,7 +2230,11 @@ class MainWindow(FluentWindow):
             new = dlg.result_entry
             for section in ("polish", "translate"):
                 if self.settings.get(section, "use_model") == old_name:
-                    self.settings.set(section, "use_model", new["name"])
+                    self.settings.set(section, "use_model",
+                                      new["name"] if new.get("capability") == "text" else "")
+            if self.settings.get("recognition", "cloud_model") == old_name:
+                self.settings.set("recognition", "cloud_model",
+                                  new["name"] if new.get("capability") == "speech" else "")
             m.clear()
             m.update(new)
             self.settings.save()
@@ -2209,6 +2250,7 @@ class MainWindow(FluentWindow):
         for m in self.settings.ai_models():
             name = m.get("name", "?")
             kind = m.get("kind", "cloud")
+            capability = m.get("capability", "text")
             model = m.get("model", "")
             host = ""
             try:
@@ -2217,7 +2259,8 @@ class MainWindow(FluentWindow):
             except Exception:
                 pass
             tag = tr("云端") if kind == "cloud" else tr("本地")
-            detail = f"{tag} · {model}" + (f" · {host}" if host else "")
+            purpose = tr("语音识别") if capability == "speech" else tr("文字对话")
+            detail = f"{purpose} · {tag} · {model}" + (f" · {host}" if host else "")
             card = ButtonCard(
                 name, detail, tr("编辑"),
                 lambda _m=m: self._edit_model(_m),
@@ -2248,35 +2291,9 @@ class MainWindow(FluentWindow):
 
         threading.Thread(target=_run_all, daemon=True).start()
 
-    @staticmethod
-    def _probe_model(m):
-        """探活一个模型: GET {base}/v1/models, 2xx=连通。后台线程内调用。"""
-        import re as _re
-        import urllib.request
-        import urllib.error
-        ep = (m.get("endpoint") or "").strip()
-        key = (m.get("api_key") or "").strip()
-        try:
-            timeout = max(3, min(int(m.get("timeout_sec") or 8), 15))
-        except Exception:
-            timeout = 8
-        # 去掉 API 路径后缀: 兼容 /v1/chat/completions、/chat/completions(无/v1)、
-        # 结尾 /v1、裸根地址 四种写法
-        base = _re.sub(r"/v1/chat/completion[s]?/?$", "", ep)  # /v1/chat/completions -> 根
-        base = _re.sub(r"/chat/completion[s]?/?$", "", base)  # 不带 /v1 的写法(含手误单数)
-        base = _re.sub(r"/?v1/?$", "", base) or ep            # 兜底: 结尾 /v1
-        url = base.rstrip("/") + "/v1/models"
-        req = urllib.request.Request(
-            url, headers={"Authorization": "Bearer " + key} if key else {})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                if 200 <= resp.status < 300:
-                    return True, tr("HTTP {code}", code=resp.status)
-                return False, tr("HTTP {code}", code=resp.status)
-        except urllib.error.HTTPError as e:
-            return False, tr("HTTP {code}", code=e.code)
-        except Exception as e:
-            return False, str(e)[:60]
+    def _probe_model(self, m):
+        """按用途实测文字聊天或语音转写接口。后台线程内调用。"""
+        return self.controller.probe_model(m)
 
     def _on_test_done(self, results):
         """主线程: 全部探活完成, 上色 + 汇总。"""
@@ -2301,6 +2318,7 @@ class MainWindow(FluentWindow):
         card = self._model_cards[idx]
         m = self.settings.ai_models()[idx]
         kind = m.get("kind", "cloud")
+        capability = m.get("capability", "text")
         model = m.get("model", "")
         host = ""
         try:
@@ -2309,7 +2327,8 @@ class MainWindow(FluentWindow):
         except Exception:
             pass
         tag = tr("云端") if kind == "cloud" else tr("本地")
-        base = f"{tag} · {model}" + (f" · {host}" if host else "")
+        purpose = tr("语音识别") if capability == "speech" else tr("文字对话")
+        base = f"{purpose} · {tag} · {model}" + (f" · {host}" if host else "")
         card.titleLabel.setText(m.get("name", "?"))
         if state == "testing":
             card.contentLabel.setText(base + " · " + tr("测试中..."))
@@ -2325,14 +2344,19 @@ class MainWindow(FluentWindow):
 
     def _refresh_model_combos(self):
         """        """
-        names = self.settings.ai_model_names()
+        speech_names = self.settings.ai_model_names("speech")
+        text_names = self.settings.ai_model_names("text")
         # 设置页云端识别模型下拉 + 无模型警告横幅
         rec_card = getattr(self, "cloud_model_card", None)
         if rec_card is not None:
-            rec_card.set_models(names, self.settings.get("recognition", "cloud_model"))
+            current = self.settings.get("recognition", "cloud_model")
+            if current not in speech_names:
+                current = speech_names[0] if speech_names else ""
+                self.settings.set("recognition", "cloud_model", current)
+            rec_card.set_models(speech_names, current)
         rec_banner = getattr(self, "rec_banner", None)
         if rec_banner is not None:
-            rec_banner.setVisible(not bool(names))
+            rec_banner.setVisible(not bool(speech_names))
         for card_attr, section in (("polish_model_card", "polish"),
                                    ("tr_model_card", "translate")):
             card = getattr(self, card_attr, None)
@@ -2341,15 +2365,17 @@ class MainWindow(FluentWindow):
             card.combo.blockSignals(True)
             cur = self.settings.get(section, "use_model")
             card.combo.clear()
-            card.combo.addItems(names)
-            if cur in names:
+            card.combo.addItems(text_names)
+            if cur in text_names:
                 card.combo.setCurrentText(cur)
-            elif names and not cur:
+            elif text_names and not cur:
                 # 没选过: 默认用第一个, 直接写回配置(否则显示有值但实际不生效)
-                card.combo.setCurrentText(names[0])
-                self.settings.set(section, "use_model", names[0])
+                card.combo.setCurrentText(text_names[0])
+                self.settings.set(section, "use_model", text_names[0])
+            elif cur not in text_names:
+                self.settings.set(section, "use_model", "")
             card.combo.blockSignals(False)
-            card.setVisible(bool(names))
+            card.setVisible(bool(text_names))
             self._update_model_banner(section)
         try:
             self.ai_models_grp._force_relayout()
@@ -2441,7 +2467,7 @@ class MainWindow(FluentWindow):
         card = getattr(self, "polish_model_card" if section == "polish" else "tr_model_card", None)
         if banner is None or card is None:
             return
-        names = self.settings.ai_model_names()
+        names = self.settings.ai_model_names("text")
         has_model = bool(names) and card.combo.currentText() in names
         if not has_model:
             banner.setStyleSheet(self._BANNER_RED)
@@ -2510,4 +2536,3 @@ class MainWindow(FluentWindow):
             self.hide()
         else:
             event.accept()
-

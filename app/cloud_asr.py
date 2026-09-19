@@ -38,22 +38,46 @@ class CloudASR:
         audio = np.concatenate(self._chunks)
         wav_bytes = self._to_wav(audio)
         try:
-            files = {"file": ("speech.wav", wav_bytes, "audio/wav")}
-            data = {"model": self.model}
-            if self.language:
-                data["language"] = self.language
-            resp = requests.post(
-                self.endpoint, headers={"Authorization": f"Bearer {self.api_key}"},
-                files=files, data=data, timeout=self.timeout,
-            )
-            if resp.status_code != 200:
-                self.last_error = f"云端返回 {resp.status_code}: {resp.text[:200]}"
-                return ""
-            out = resp.json()
-            return out.get("text", "").strip()
+            return self.transcribe_wav(wav_bytes)
         except Exception as e:
             self.last_error = f"云端请求失败: {e}"
             return ""
+
+    def transcribe_wav(self, wav_bytes: bytes) -> str:
+        """发送一个 WAV 到真实转写接口；失败时抛异常，供识别和连通测试复用。"""
+        if not self.endpoint:
+            raise ValueError("未配置语音识别 API 地址")
+        if not self.api_key:
+            raise ValueError("未配置云端 API Key")
+        if not self.model:
+            raise ValueError("未配置语音识别模型名")
+        files = {"file": ("speech.wav", wav_bytes, "audio/wav")}
+        data = {"model": self.model}
+        if self.language:
+            data["language"] = self.language
+        resp = requests.post(
+            self.endpoint, headers={"Authorization": f"Bearer {self.api_key}"},
+            files=files, data=data, timeout=self.timeout,
+        )
+        if not 200 <= resp.status_code < 300:
+            body = (resp.text or "").replace("\r", " ").replace("\n", " ")[:200]
+            raise RuntimeError(f"云端返回 HTTP {resp.status_code}: {body}")
+        try:
+            out = resp.json()
+        except ValueError as e:
+            raise RuntimeError("语音接口返回的不是 JSON") from e
+        if not isinstance(out, dict):
+            raise RuntimeError("语音接口返回格式无效")
+        return str(out.get("text", "") or "").strip()
+
+    @classmethod
+    def probe(cls, endpoint: str, api_key: str, model: str,
+              timeout_sec: int = 15) -> tuple:
+        """用短静音 WAV 实测语音转写接口，而不是错误地发送聊天 JSON。"""
+        engine = cls(endpoint, api_key, model, timeout_sec=timeout_sec)
+        samples = np.zeros(8000, dtype=np.float32)  # 0.5 秒、16 kHz 合法 WAV
+        engine.transcribe_wav(cls._to_wav(samples))
+        return True, "语音识别接口请求成功"
 
     @staticmethod
     def _to_wav(samples: np.ndarray, sample_rate: int = 16000) -> bytes:

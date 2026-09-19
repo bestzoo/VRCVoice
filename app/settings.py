@@ -110,7 +110,8 @@ DEFAULTS = {
         "local_api_key": "",
     },
     "ai_models": {
-        "list": [],   # 模型库: [{name, kind(cloud/local), provider, endpoint, api_key, model, timeout_sec}]
+        # capability: text=润色/翻译用文字模型, speech=云端语音识别模型
+        "list": [],   # [{name, capability, kind, provider, endpoint, api_key, model, timeout_sec}]
     },
     "vr_overlay": {
         "enabled": True,
@@ -182,6 +183,17 @@ class Settings:
         if not saved or not isinstance(saved, dict):
             return
         lst = self.data.setdefault("ai_models", {}).setdefault("list", [])
+        # 0) 0.9.x 模型库没有 capability。按接口/模型名自动补齐，避免升级后
+        #    语音模型出现在润色/翻译列表，或文字模型被识别后端误选。
+        for entry in lst:
+            if entry.get("capability") in ("text", "speech"):
+                continue
+            endpoint = (entry.get("endpoint") or "").lower()
+            model = (entry.get("model") or "").lower()
+            is_speech = ("/audio/" in endpoint or "transcription" in endpoint
+                         or "sensevoice" in model or "speechasr" in model
+                         or "whisper" in model)
+            entry["capability"] = "speech" if is_speech else "text"
         if lst:
             return
         # 1) 云端: AI 润色的真实配置(有 Key 才算数)
@@ -191,6 +203,7 @@ class Settings:
             name = model.split("/")[-1] or "云端模型"
             lst.append({
                 "name": name, "kind": "cloud",
+                "capability": "text",
                 "provider": (ps.get("provider") or "custom").strip() or "custom",
                 "endpoint": (ps.get("endpoint") or "").strip(),
                 "api_key": (ps.get("api_key") or "").strip(),
@@ -207,6 +220,7 @@ class Settings:
             name = (model.split("/")[-1] or "翻译模型") + "-翻译"
             lst.append({
                 "name": name, "kind": "cloud",
+                "capability": "text",
                 "provider": (ts.get("provider") or "custom").strip() or "custom",
                 "endpoint": (ts.get("endpoint") or "").strip(),
                 "api_key": (ts.get("api_key") or "").strip(),
@@ -221,6 +235,7 @@ class Settings:
             name = f"本地 {model}"
             lst.append({
                 "name": name, "kind": "local",
+                "capability": "text",
                 "provider": "openai",
                 "endpoint": (ts.get("local_endpoint") or "").strip()
                              or "http://127.0.0.1:11434/v1/chat/completions",
@@ -278,9 +293,10 @@ class Settings:
         """模型库条目列表(引用, 直接改后需 save())。"""
         return self.data.setdefault("ai_models", {}).setdefault("list", [])
 
-    def ai_model_names(self) -> list:
-        """模型库全部条目名(去空)。"""
-        return [m.get("name", "") for m in self.ai_models() if m.get("name")]
+    def ai_model_names(self, capability: str = "") -> list:
+        """模型库条目名；可按 text/speech 用途过滤。"""
+        return [m.get("name", "") for m in self.ai_models()
+                if m.get("name") and (not capability or m.get("capability", "text") == capability)]
 
     def default_model_dir(self) -> str:
         """模型目录: 配置了就用配置的, 否则用工作目录下 models/"""
